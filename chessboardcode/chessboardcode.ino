@@ -1,14 +1,9 @@
 #include <driver/i2s.h>
-
-// 1. YOUR PINS
-// ===================================
 #define I2S_WS 13
 #define I2S_SD 27
 #define I2S_SCK 25
-
 #define I2S_PORT I2S_NUM_0
 #define bufferLen 64
-// ===================================
 
 int16_t sBuffer[bufferLen];
 void setup() {

@@ -1,230 +1,306 @@
-#include <WiFi.h>
-#include <WiFiClientSecure.h> // 1. ADD THIS LINE
-#include <HTTPClient.h>     // For making web requests
-#include <ArduinoJson.h>    // For parsing Google's response
-#include <Base64.h>         // For encoding the audio
-#include "driver/i2s.h"
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
-// ===================================
-// 1. ENTER YOUR WI-FI INFO
-// ===================================
-const char* ssid = "";
-const char* password = "";
+// ble uuids
+static const char* SERVICE_UUID   = "b5b10001-6f3b-4c90-8e2b-7d1a2fa9c001";
+static const char* CMD_CHAR_UUID  = "b5b10002-6f3b-4c90-8e2b-7d1a2fa9c002"; // write
+static const char* ACK_CHAR_UUID  = "b5b10003-6f3b-4c90-8e2b-7d1a2fa9c003"; // notify
 
-// ===================================
-// 2. ENTER YOUR GOOGLE API KEY
-// ===================================
-String GOOGLE_API_KEY = "";
+// intervals
+const unsigned long HEARTBEAT_INTERVAL_MS = 5000;
+unsigned long lastHeartbeat = 0;
 
-// ===================================
-// 3. YOUR PINS
-// ===================================
-#define I2S_WS 13
-#define I2S_SD 27
-#define I2S_SCK 25
-#define I2S_PORT I2S_NUM_0
+// stage timing
+const unsigned long STAGE2_TRAVEL_MS = 2500;   // moving magnet across board
+const unsigned long STAGE3_MOVE_MS   = 2500;   // moving piece to destination
+const unsigned long COOLDOWN_MS      = 5000;   // cooldown before next input
 
-// ===================================
-// 4. AUDIO RECORDING SETTINGS
-// ===================================
-#define SAMPLE_RATE 16000
-#define RECORD_DURATION_SECONDS 1 // 1 second
-#define RECORD_BUFFER_SIZE (SAMPLE_RATE * RECORD_DURATION_SECONDS)
+// stage fsm
+enum StageState {
+  STAGE_IDLE = 0,          // stage 1
+  STAGE_MOVE_TRAVEL,       // stage 2
+  STAGE_MOVE_PICKPLACE,    // stage 3
+  STAGE_COOLDOWN
+};
+StageState stageState = STAGE_IDLE;
+unsigned long stageStartMs = 0;
 
-// Audio buffer
-int16_t audioBuffer[RECORD_BUFFER_SIZE];
+// gatt global vars
+BLEServer*         g_server          = nullptr;
+BLECharacteristic* g_cmdChar         = nullptr;  // write-only (from client)
+BLECharacteristic* g_ackChar         = nullptr;  // notify-only (to client)
+bool               g_clientConnected = false;
 
-// The HTTP client objects
-WiFiClientSecure client; // 2. CHANGE THIS LINE
-HTTPClient http;
+// standardized data structure
+struct MoveCmd {
+  String id;
+  String notation;
+  String fromSq;
+  String toSq;
+  String piece;    // normalized uppercase P,N,B,R,Q,K
+  String type;     // optional "move"
+  String source;   // optional "ui" | "voice"
+  String timestamp;
+  bool   valid = false;
+};
 
+// service function: send ble notify (acks/status) safely if a client is connected
+void bleNotify(const String& msg) {
+  if (!g_clientConnected || !g_ackChar) return;
+  g_ackChar->setValue(msg.c_str());
+  g_ackChar->notify();
+}
+
+// service function: print + notify a status line
+void printStatus(const String& s) {
+  Serial.print("status:");
+  Serial.println(s);
+  bleNotify("status:" + s);
+}
+
+// service function: print + notify ack accepted
+void printAckAccepted(const String& id) {
+  String m = "ack:accepted " + id;
+  Serial.println(m);
+  bleNotify(m);
+}
+
+// service function: print + notify ack done
+void printAckDone(const String& id) {
+  String m = "ack:done " + id;
+  Serial.println(m);
+  bleNotify(m);
+}
+
+// service function: print + notify ack error with reason
+void printAckError(const String& id, const String& reason) {
+  String m = "ack:error " + id + " " + reason;
+  Serial.println(m);
+  bleNotify(m);
+}
+
+// service function: print stage 1 banner
+void printStage1() {
+  Serial.println("Stage 1: Ready for Input. Electromagnet and Motor OFF.");
+}
+
+// service function: enter a new stage and emit the one-time banner for that stage
+void enterStage(StageState s) {
+  stageState = s;
+  stageStartMs = millis();
+  switch (s) {
+    case STAGE_IDLE:
+      printStage1();
+      break;
+    case STAGE_MOVE_TRAVEL:
+      Serial.println("Motors ON. Electromagnet OFF. Moving magnet across the board.");
+      break;
+    case STAGE_MOVE_PICKPLACE:
+      Serial.println("Motors ON. Electromagnet ON. Moving chess piece to destination.");
+      break;
+    case STAGE_COOLDOWN:
+      Serial.println("Move complete. Returning to idle state.");
+      Serial.println("Cooling down for 5 seconds before next move...");
+      break;
+  }
+}
+
+// service function: parse "CMD key=value key=value ..." into MoveCmd
+bool parseStandardCommand(const String& line, MoveCmd& out) {
+  if (!line.startsWith("CMD ")) return false;
+
+  MoveCmd m;
+  int pos = 4; // skip "CMD "
+  while (pos < line.length()) {
+    int space = line.indexOf(' ', pos);
+    String token = (space == -1) ? line.substring(pos) : line.substring(pos, space);
+    token.trim();
+    if (token.length() > 0) {
+      int eq = token.indexOf('=');
+      if (eq > 0) {
+        String key = token.substring(0, eq);
+        String val = token.substring(eq + 1);
+        key.trim(); val.trim();
+        key.toLowerCase();
+
+        if      (key == "id")        m.id        = val;
+        else if (key == "notation")  m.notation  = val;
+        else if (key == "from")      m.fromSq    = val;
+        else if (key == "to")        m.toSq      = val;
+        else if (key == "piece")     m.piece     = val;
+        else if (key == "type")      m.type      = val;
+        else if (key == "source")    m.source    = val;
+        else if (key == "timestamp") m.timestamp = val;
+        // unknown keys ignored safely (everything else ignored)
+      }
+    }
+    if (space == -1) break;
+    pos = space + 1;
+  }
+
+  // min required fields
+  if (m.id.isEmpty() || m.notation.isEmpty() || m.fromSq.isEmpty() || m.toSq.isEmpty() || m.piece.isEmpty()) {
+    return false;
+  }
+
+  // optional
+  if (m.type.length() && !(m.type == "move" || m.type == "MOVE")) {
+    return false;
+  }
+
+  // validate squares
+  auto isSquare = [](const String& sq)->bool{
+    if (sq.length() != 2) return false;
+    char f = sq.charAt(0), r = sq.charAt(1);
+    return (f >= 'a' && f <= 'h') && (r >= '1' && r <= '8');
+  };
+  if (!isSquare(m.fromSq) || !isSquare(m.toSq)) return false;
+
+  // normalize piece to uppercase P/N/B/R/Q/K
+  char p = m.piece.charAt(0);
+  if (p >= 'a' && p <= 'z') p -= 32;
+  if (!(p=='P'||p=='N'||p=='B'||p=='R'||p=='Q'||p=='K')) return false;
+  m.piece = String(p);
+
+  m.valid = true;
+  out = m;
+  return true;
+}
+
+// service class: server connection callbacks (connect/disconnect events)
+class ServerCB : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override {
+    g_clientConnected = true;
+    printStatus("connected");
+    printStage1(); // show we are in stage 1
+  }
+  void onDisconnect(BLEServer* pServer) override {
+    g_clientConnected = false;
+    printStatus("disconnected");
+    pServer->getAdvertising()->start();
+  }
+};
+
+// service class: characteristic write callback (incoming cmd event)
+class CmdWriteCB : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* ch) override {
+    // event checker: incoming write -> read payload into string
+    String line = String(ch->getValue().c_str());
+    line.trim();
+    if (line.length() == 0) return;
+
+    // event checker: standardized command parse
+    MoveCmd cmd;
+    bool ok = parseStandardCommand(line, cmd);
+    if (!ok) {
+      printAckError("unknown", "bad_format");
+      return;
+    }
+
+    // event checker: reject if stage is not idle (busy)
+    if (stageState != STAGE_IDLE) {
+      printAckError(cmd.id, "busy");
+      return;
+    }
+
+    // service function: acknowledge acceptance
+    printAckAccepted(cmd.id);
+
+    // service function: print parsed contents (unchanged)
+    Serial.println("----- RECEIVED STANDARDIZED MOVE (BLE) -----");
+    Serial.print("id: ");        Serial.println(cmd.id);
+    Serial.print("type: ");      Serial.println(cmd.type.length() ? cmd.type : "move");
+    Serial.print("notation: ");  Serial.println(cmd.notation);
+    Serial.print("from: ");      Serial.println(cmd.fromSq);
+    Serial.print("to: ");        Serial.println(cmd.toSq);
+    Serial.print("piece: ");     Serial.println(cmd.piece);
+    Serial.print("source: ");    Serial.println(cmd.source.length() ? cmd.source : "(unspecified)");
+    Serial.print("timestamp: "); Serial.println(cmd.timestamp.length() ? cmd.timestamp : "(unspecified)");
+    Serial.println("------------------------------------------------");
+
+    // service function: immediate done ack (preserves previous behavior)
+    printAckDone(cmd.id);
+
+    // service function: start staged flow (non-blocking)
+    enterStage(STAGE_MOVE_TRAVEL);
+  }
+};
+
+// service function: device setup and gatt init
 void setup() {
   Serial.begin(115200);
-  Serial.println("Booting up...");
-  
-  // Tell the client to skip certificate verification.
-  client.setInsecure(); 
-  
-  setup_wifi(); 
+  Serial.println("\nVibeChess – BLE Receiver Init");
 
-  Serial.println("Setting up I2S (16000 Hz)...");
-  i2s_install();
-  i2s_setpin();
-  i2s_start(I2S_PORT);
-  
-  Serial.println("\nReady!");
-  Serial.println("Type 'r' and press Enter to start recording...");
+  BLEDevice::init("VibeChess-Board");
+  g_server = BLEDevice::createServer();
+  g_server->setCallbacks(new ServerCB());
+
+  BLEService* service = g_server->createService(SERVICE_UUID);
+
+  g_ackChar = service->createCharacteristic(
+      ACK_CHAR_UUID,
+      BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
+  );
+  g_ackChar->addDescriptor(new BLE2902());
+
+  g_cmdChar = service->createCharacteristic(
+      CMD_CHAR_UUID,
+      BLECharacteristic::PROPERTY_WRITE
+  );
+  g_cmdChar->setCallbacks(new CmdWriteCB());
+
+  service->start();
+
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(SERVICE_UUID);
+  adv->setScanResponse(true);
+  adv->setMinPreferred(0x06);
+  adv->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+
+  // service function: initialize fsm into stage 1 and print banner
+  enterStage(STAGE_IDLE);
+
+  // service function: first heartbeat setup
+  printStatus("ready");
+  lastHeartbeat = millis();
 }
 
+// event checker: main loop tick (timers, heartbeats, and fsm transitions)
 void loop() {
-  if (Serial.available() > 0) {
-    char command = Serial.read();
-    if (command == 'r') {
-      recordAudio();
-      sendToGoogle();
-      Serial.println("\nType 'r' and press Enter to start recording...");
-    }
-  }
-}
+  unsigned long now = millis();
 
-void recordAudio() {
-  Serial.println("Recording...");
-  
-  size_t bytes_read = 0;
-  esp_err_t result = i2s_read(I2S_PORT, 
-                              &audioBuffer, 
-                              sizeof(audioBuffer),
-                              &bytes_read, 
-                              portMAX_DELAY);
-
-  if (result != ESP_OK) {
-    Serial.println("Error reading from I2S");
+  // event checker: heartbeat interval
+  if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
+    printStatus("ready");
+    lastHeartbeat = now;
   }
 
-  int samples_read = bytes_read / 2;
-  Serial.printf("Recording complete! Read %d samples.\n", samples_read);
-}
+  // event checker: stage timers and transitions (non-blocking fsm)
+  switch (stageState) {
+    case STAGE_IDLE:
+      // idle accepts new commands (no action here)
+      break;
 
-void sendToGoogle() {
-  Serial.println("Connecting to Google Speech-to-Text...");
-  
-  String url = "https://speech.googleapis.com/v1/speech:recognize?key=" + GOOGLE_API_KEY;
-  
-  if (http.begin(client, url)) { 
-    http.addHeader("Content-Type", "application/json");
-
-    Serial.println("Encoding audio...");
-    String base64Audio;
-    uint8_t* audioBytes = (uint8_t*)audioBuffer; // Corrected type
-    int audioBytesLength = sizeof(audioBuffer);
-    
-    base64Audio = base64::encode(audioBytes, audioBytesLength);
-
-    Serial.println("Creating JSON request...");
-    
-    DynamicJsonDocument jsonRequest(1024 + base64Audio.length());
-    
-    JsonObject config = jsonRequest.createNestedObject("config");
-    config["encoding"] = "LINEAR16";
-    config["sampleRateHertz"] = SAMPLE_RATE;
-    config["languageCode"] = "en-US";
-    
-    JsonArray speechContexts = config.createNestedArray("speechContexts");
-    JsonObject context = speechContexts.createNestedObject();
-    JsonArray phrases = context.createNestedArray("phrases");
-    phrases.add("knight"); phrases.add("bishop"); phrases.add("rook");
-    phrases.add("queen"); phrases.add("king"); phrases.add("pawn");
-    phrases.add("to");
-    phrases.add("a"); phrases.add("b"); phrases.add("c"); phrases.add("d");
-    phrases.add("e"); phrases.add("f"); phrases.add("g"); phrases.add("h");
-    phrases.add("one"); phrases.add("two"); phrases.add("three"); phrases.add("four");
-    phrases.add("five"); phrases.add("six"); phrases.add("seven"); phrases.add("eight");
-
-    JsonObject audio = jsonRequest.createNestedObject("audio");
-    audio["content"] = base64Audio;
-
-    String requestBody;
-    serializeJson(jsonRequest, requestBody);
-    
-    Serial.println("Sending request to Google...");
-    int httpResponseCode = http.POST(requestBody);
-
-    if (httpResponseCode > 0) {
-      Serial.printf("HTTP Response code: %d\n", httpResponseCode);
-      String responseBody = http.getString();
-      
-      Serial.println("Parsing response...");
-      jsonRequest.clear();
-      
-      DeserializationError error = deserializeJson(jsonRequest, responseBody);
-      if (error) {
-        Serial.print("deserializeJson() failed: ");
-        Serial.println(error.c_str());
-        Serial.println("Full response:");
-        Serial.println(responseBody);
-        http.end();
-        return;
+    case STAGE_MOVE_TRAVEL:
+      if (now - stageStartMs >= STAGE2_TRAVEL_MS) {
+        enterStage(STAGE_MOVE_PICKPLACE);
       }
+      break;
 
-      const char* transcript = jsonRequest["results"][0]["alternatives"][0]["transcript"];
-      
-      if (transcript) {
-        Serial.println("========================================");
-        Serial.printf("Transcript: %s\n", transcript);
-        Serial.println("========================================");
-      } else {
-        Serial.println("Error: Could not find transcript in response.");
-        Serial.println(responseBody);
+    case STAGE_MOVE_PICKPLACE:
+      if (now - stageStartMs >= STAGE3_MOVE_MS) {
+        enterStage(STAGE_COOLDOWN);
       }
-      
-    } else {
-      Serial.printf("HTTP Error: %s\n", http.errorToString(httpResponseCode).c_str());
-    }
+      break;
 
-    http.end();
-  } else {
-    Serial.println("Failed to connect to Google API");
+    case STAGE_COOLDOWN:
+      if (now - stageStartMs >= COOLDOWN_MS) {
+        enterStage(STAGE_IDLE);
+      }
+      break;
   }
 }
-
-// ===================================
-// WI-FI SETUP FUNCTION
-// ===================================
-void setup_wifi() {
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("");
-  Serial.println("WiFi connected!");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-}
-
-// ===================================
-// I2S FUNCTIONS (TYPO FIXED)
-// ===================================
-void i2s_install(){
-  const i2s_config_t i2s_config = {
-    .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate = SAMPLE_RATE, 
-    .bits_per_sample = i2s_bits_per_sample_t(16),
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = 0,
-    .dma_buf_count = 8,
-    .dma_buf_len = 128, // This is the corrected typo
-    .use_apll = false
-  };
-  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
-}
-
-void i2s_setpin(){
-  const i2s_pin_config_t pin_config = {
-    .bck_io_num = I2S_SCK,
-    .ws_io_num = I2S_WS,
-    .data_out_num = -1,
-    .data_in_num = I2S_SD
-  };
-  i2s_set_pin(I2S_PORT, &pin_config);
-}
-
-and this is my issue right now
-
-18:12:46.509 -> Sending request to Google...
-18:12:46.674 -> HTTP Error: connection refused
-18:12:46.674 -> 
-18:12:46.674 -> Type 'r' and press Enter to start recording...
-18:17:15.063 -> Recording...
-18:17:15.985 -> Recording complete! Read 16000 samples.
-18:17:15.985 -> Connecting to Google Speech-to-Text...
-18:17:15.985 -> Encoding audio...
-18:17:15.985 -> Creating JSON request...
-18:17:17.009 -> Sending request to Google...
-18:17:17.040 -> HTTP Error: connection refused
-18:17:17.040 -> 
-18:17:17.040 -> Type 'r' and press Enter to start recording...

@@ -98,7 +98,8 @@ void motorStop() {
 
 // The Core Movement Logic (Blocking with timeout)
 void moveToTarget(long target) {
-  Serial.print(">>> MOVING to Target: "); Serial.println(target);
+  // CHANGED LOG: Narrative style
+  // We don't print "Moving to target" here because the main loop does it more descriptively.
   digitalWrite(LED_PIN, HIGH);
 
   unsigned long startTime = millis();
@@ -111,7 +112,7 @@ void moveToTarget(long target) {
       if (c == 's') {
         motorStop();
         Serial.read(); 
-        Serial.println(">>> EMERGENCY STOP");
+        Serial.println(">>> EMERGENCY STOP TRIGGERED");
         break;
       }
     }
@@ -120,24 +121,26 @@ void moveToTarget(long target) {
     long current = encoder.getCount();
     long error = target - current; 
 
-    // 3. Debug Print (Every 500ms)
+    // 3. Debug Print (Every 500ms) -> CHANGED LOG FORMAT
     if (millis() - lastPrintTime > 500) {
       lastPrintTime = millis();
-      Serial.print("   Pos: "); Serial.print(current);
-      Serial.print(" | Err: "); Serial.println(error);
+      Serial.print("   Current X Position: "); 
+      Serial.print(current);
+      Serial.print(" | Distance to Travel: "); 
+      Serial.println(error);
     }
 
     // 4. Success?
     if (abs(error) <= TOLERANCE) {
       motorStop();
-      Serial.print(">>> ARRIVED! Final Pos: "); Serial.println(current);
+      Serial.print("   >>> ARRIVED! Final Position: "); Serial.println(current);
       break;
     }
 
     // 5. Timeout?
     if (millis() - startTime > TIMEOUT_MS) {
       motorStop();
-      Serial.println(">>> TIMEOUT ERROR!");
+      Serial.println("   >>> TIMEOUT ERROR! Motor stuck?");
       break;
     }
 
@@ -162,25 +165,24 @@ void bleNotify(const String& msg) {
 }
 
 void printStatus(const String& s) {
-  Serial.print("status:"); Serial.println(s);
   bleNotify("status:" + s);
 }
 
 void printAckAccepted(const String& id) {
   String m = "ack:accepted " + id;
-  Serial.println(m);
+  // Serial.println(">>> BLE: Sent " + m); // Optional: Hide technical ACK log
   bleNotify(m);
 }
 
 void printAckDone(const String& id) {
   String m = "ack:done " + id;
-  Serial.println(m);
+  // Serial.println(">>> BLE: Sent " + m); // Optional: Hide technical ACK log
   bleNotify(m);
 }
 
 void printAckError(const String& id, const String& reason) {
   String m = "ack:error " + id + " " + reason;
-  Serial.println(m);
+  Serial.println("ERROR: " + m);
   bleNotify(m);
 }
 
@@ -215,7 +217,7 @@ bool parseStandardCommand(const String& line, MoveCmd& out) {
     pos = space + 1;
   }
 
-  if (m.id.isEmpty() || m.notation.isEmpty() || m.fromSq.isEmpty() || m.toSq.isEmpty() || m.piece.isEmpty()) {
+  if (m.id.isEmpty() || m.toSq.isEmpty()) {
     return false;
   }
   m.valid = true;
@@ -230,10 +232,12 @@ bool parseStandardCommand(const String& line, MoveCmd& out) {
 class ServerCB : public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) override {
     g_clientConnected = true;
+    Serial.println("\n>>> CONNECTION: App Connected Successfully.");
     printStatus("connected");
   }
   void onDisconnect(BLEServer* pServer) override {
     g_clientConnected = false;
+    Serial.println("\n>>> CONNECTION: App Disconnected.");
     printStatus("disconnected");
     pServer->getAdvertising()->start();
   }
@@ -250,39 +254,64 @@ class CmdWriteCB : public BLECharacteristicCallbacks {
     bool ok = parseStandardCommand(line, cmd);
     if (!ok) {
       printAckError("unknown", "bad_format");
+      Serial.println("ERROR: Bad Command Format Received: " + line);
       return;
     }
 
-    // 2. Acknowledge
+    // 2. Acknowledge Immediately (Fixes UI "undefined")
     printAckAccepted(cmd.id);
 
-    // 3. DEBUG: Show what we received
-    Serial.println("----- BLE MOVE RECEIVED -----");
-    Serial.print("To Square: "); Serial.println(cmd.toSq);
-
-    // 4. EXTRACT DESTINATION FILE (X-Axis)
-    // 'a'->1, 'b'->2, ... 'h'->8
-    char fileChar = cmd.toSq.charAt(0); 
-    int fileIndex = 0;
+    // =============================================================
+    //                 CHANGED: NARRATIVE LOGGING
+    // =============================================================
     
-    if (fileChar >= 'a' && fileChar <= 'h') {
-      fileIndex = fileChar - 'a' + 1;
-    } else if (fileChar >= 'A' && fileChar <= 'H') {
-      fileIndex = fileChar - 'A' + 1;
-    }
+    Serial.println("\n================================================");
+    Serial.print("User Input: User moved ");
+    Serial.print(cmd.piece); // e.g. "P"
+    Serial.print(" from ");
+    Serial.print(cmd.fromSq);
+    Serial.print(" to ");
+    Serial.println(cmd.toSq);
+    Serial.println("================================================");
 
+    // 4. EXTRACT COORDINATES
+    char fileChar = cmd.toSq.charAt(0); 
+    char rankChar = cmd.toSq.charAt(1);
+
+    // --- X-AXIS (FILES) ---
+    int fileIndex = 0;
+    if (fileChar >= 'a' && fileChar <= 'h') fileIndex = fileChar - 'a' + 1;
+    else if (fileChar >= 'A' && fileChar <= 'H') fileIndex = fileChar - 'A' + 1;
+
+    // --- Y-AXIS (RANKS) ---
+    int rankIndex = 0;
+    if (rankChar >= '1' && rankChar <= '8') rankIndex = rankChar - '0';
+
+    // 5. EXECUTION LOGIC
     if (fileIndex >= 1 && fileIndex <= 8) {
-      // 5. TRIGGER PHYSICAL MOVE
-      long targetCounts = calculateSquareTarget(fileIndex);
-      Serial.print("Mapped File '"); Serial.print(fileChar);
-      Serial.print("' to Index "); Serial.print(fileIndex);
-      Serial.print(" -> Target: "); Serial.println(targetCounts);
       
-      moveToTarget(targetCounts); // This executes the move logic
+      long targetCounts = calculateSquareTarget(fileIndex);
+
+      // --- X-AXIS LOGIC ---
+      Serial.println("Sending Logic to X-Axis Motor...");
+      Serial.print("ACTION (X-Direction): Moving Motor to ");
+      Serial.println(targetCounts);
+      
+      // Execute X Move
+      moveToTarget(targetCounts); 
+
+      // --- Y-AXIS LOGIC ---
+      Serial.println("Sending Logic to Y-Axis Motor...");
+      Serial.println("ACTION (Y-Direction): NOT IMPLEMENTED YET");
+      // (No physical move here yet)
       
       printAckDone(cmd.id);
+      Serial.println("Move Complete. Awaiting next input.");
+      Serial.println("------------------------------------------------");
+      
     } else {
       printAckError(cmd.id, "invalid_file");
+      Serial.println("ERROR: Invalid File Character: " + String(fileChar));
     }
   }
 };
@@ -293,7 +322,7 @@ class CmdWriteCB : public BLECharacteristicCallbacks {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== VIBECHESS HARDWARE + BLE CONTROLLER ===");
+  Serial.println("\n=== VIBECHESS CONTROLLER ===");
 
   // --- HARDWARE INIT ---
   ESP32Encoder::useInternalWeakPullResistors = puType::up;
@@ -329,10 +358,7 @@ void setup() {
 
   // --- READY ---
   printStatus("ready");
-  Serial.println("MANUAL CONTROLS:");
-  Serial.println("  [1-8] : Go to Square");
-  Serial.println("  z, f, r, s, i : Zero, Fwd, Rev, Stop, Invert");
-  Serial.println("BLE LISTENER ACTIVE.");
+  Serial.println("SYSTEM READY. Waiting for connection...");
   lastHeartbeat = millis();
 }
 
@@ -343,13 +369,13 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // 1. HEARTBEAT (For App Connectivity)
+  // 1. HEARTBEAT
   if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
     printStatus("ready");
     lastHeartbeat = now;
   }
 
-  // 2. MANUAL SERIAL INPUT (For Debugging)
+  // 2. MANUAL SERIAL INPUT
   if (Serial.available() > 0) {
     String input = Serial.readStringUntil('\n');
     input.trim(); 
@@ -357,7 +383,6 @@ void loop() {
     if (input.length() > 0) {
       char firstChar = input.charAt(0);
 
-      // Commands
       if (firstChar == 'i') {
         invertDirection = !invertDirection;
         motorStop();
@@ -368,17 +393,16 @@ void loop() {
       else if (firstChar == 's') { Serial.println("STOP"); motorStop(); }
       else if (firstChar == 'z') { encoder.setCount(0); Serial.println(">>> ZEROED"); }
       
-      // Numeric Input
       else if (isDigit(firstChar) || firstChar == '-') {
         long val = input.toInt();
         if (val >= 1 && val <= 8) {
-          Serial.print(">>> SQUARE COMMAND: "); Serial.print(val);
+          Serial.print(">>> MANUAL CMD: Square "); Serial.print(val);
           long squareTarget = calculateSquareTarget((int)val);
-          Serial.print(" (Target: "); Serial.print(squareTarget); Serial.println(")");
+          Serial.print(" -> Target: "); Serial.println(squareTarget);
           moveToTarget(squareTarget);
         }
         else {
-           Serial.print(">>> RAW COUNT COMMAND: "); Serial.println(val);
+           Serial.print(">>> MANUAL CMD: Raw Counts "); Serial.println(val);
            moveToTarget(val);
         }
       }

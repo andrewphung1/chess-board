@@ -10,21 +10,18 @@
 // =================================================================================
 
 // --- X-AXIS (Belt) ---
-// Driver Channel A (Pins 26 & 25)
 #define X_PWM_1 26     
 #define X_PWM_2 25     
-#define X_ENC_A 27 
+#define X_ENC_A 27
 #define X_ENC_B 33 
 
 // --- Y-AXIS (Lead Screw) ---
-// Driver Channel B (Pins 14 & 12)
 #define Y_PWM_1 14     
 #define Y_PWM_2 12     
 #define Y_ENC_A 15 
 #define Y_ENC_B 32 
 
 // --- Z-AXIS (Magnet) ---
-// Driver 2 (Pins 4 & 13) - Time Based
 #define Z_PWM_1 4
 #define Z_PWM_2 13
 
@@ -36,13 +33,13 @@
 
 // --- X-AXIS (Belt) ---
 const float X_COUNTS_PER_INCH = 720.12;  
-const float X_DIST_TO_SQ1     = 0.875;   
+const float X_DIST_TO_SQ1     = 0.965;   
 const float X_PITCH           = 1.500;   
 
 // --- Y-AXIS (Lead Screw) ---
 const float Y_COUNTS_PER_INCH = 4500.0; 
 const float Y_WALL_TO_CENTER  = 0.750;
-const float Y_MAGNET_OFFSET   = 0.500;
+const float Y_MAGNET_OFFSET   = 0.95;
 const float Y_PITCH           = 1.500; 
 
 // =================================================================================
@@ -58,12 +55,12 @@ const int TIMEOUT_X_MS  = 5000;
 // --- Y-AXIS ---
 const int MAX_SPEED_Y   = 255;   
 const int MIN_SPEED_Y   = 170;   
-const int PRE_STOP_Y    = 2500;  // Coasting distance
+const int PRE_STOP_Y    = 2500;  
 const int TIMEOUT_Y_MS  = 10000;
 
 // --- Z-AXIS ---
-int zSpeed              = 170;   // Safe speed
-const int TIMEOUT_Z_MS  = 2000;  // Max run time
+int zSpeed              = 170;   
+const int TIMEOUT_Z_MS  = 2000;
 
 const int TOLERANCE     = 15;    
 
@@ -200,9 +197,7 @@ bool moveToTarget(ESP32Encoder& activeEnc, long target, int axisID) {
       Serial.println(" | Err: " + String(error));
     }
 
-    // --- STOP CONDITIONS ---
     bool stopNow = false;
-
     if (axisID == 0 && dist <= TOLERANCE) stopNow = true;
     if (axisID == 1) {
       if (dist <= TOLERANCE) stopNow = true; 
@@ -211,27 +206,9 @@ bool moveToTarget(ESP32Encoder& activeEnc, long target, int axisID) {
     }
 
     if (stopNow) {
-      // 1. Trigger Stop
       if (axisID == 1) brakeY(); 
-      else stopAll(); 
-      
-      long posAtCutoff = activeEnc.getCount();
-      Serial.println(">>> STOP COMMAND SENT at " + String(posAtCutoff));
-      Serial.println(">>> Waiting 2.0s for settling...");
-
-      // 2. WAIT 2 SECONDS (As requested)
-      delay(2000);
-
-      // 3. REPORT FINAL POSITION
-      long finalPos = activeEnc.getCount();
-      long drift = abs(finalPos - posAtCutoff);
-      long finalError = abs(target - finalPos);
-      
-      Serial.println(">>> FINAL RESTING POS: " + String(finalPos));
-      Serial.println(">>> DRIFT AMOUNT: " + String(drift));
-      Serial.println(">>> FINAL ERROR: " + String(finalError));
-      Serial.println("-----------------------------------");
-      
+      else stopAll();            
+      Serial.println(">>> " + label + " ARRIVED! Final: " + String(activeEnc.getCount()));
       return true;
     }
 
@@ -270,15 +247,10 @@ void printStatus(const String& s) {}
 void setup() {
   Serial.begin(115200);
   
-  // Stabilization Delay
-  delay(500);
-
-  // Encoders
   ESP32Encoder::useInternalWeakPullResistors = puType::up;
   encX.attachHalfQuad(X_ENC_A, X_ENC_B); encX.setCount(0);
   encY.attachHalfQuad(Y_ENC_A, Y_ENC_B); encY.setCount(0);
 
-  // Motors
   ledcAttach(X_PWM_1, 5000, 8); ledcAttach(X_PWM_2, 5000, 8);
   ledcAttach(Y_PWM_1, 5000, 8); ledcAttach(Y_PWM_2, 5000, 8);
   ledcAttach(Z_PWM_1, 5000, 8); ledcAttach(Z_PWM_2, 5000, 8);
@@ -286,7 +258,7 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   stopAll();
 
-  Serial.println("\n=== VIBECHESS MASTER (SETTLING VERIFICATION) ===");
+  Serial.println("\n=== VIBECHESS MASTER (MANUAL) ===");
   Serial.println("X: 'x1'-'x8', 'x[Num]', 'f'/'b'");
   Serial.println("Y: 'y1'-'y8', 'y[Num]', 'l'/'r'");
   Serial.println("Z: 'u'/'d'");
@@ -301,18 +273,11 @@ void loop() {
 
     char c = input.charAt(0);
     
-    // --- STOP COMMAND (With Reporting) ---
-    if (c == 's') { 
-      stopAll(); 
-      Serial.println(">>> STOPPING. Waiting 2s for settle...");
-      delay(2000);
-      Serial.print("Final X: "); Serial.print(encX.getCount());
-      Serial.print(" | Final Y: "); Serial.println(encY.getCount());
-      return; 
-    }
+    if (c == 's') { stopAll(); return; }
 
     // --- X COMMANDS ---
     if (c == 'x') {
+      // Is it x1...x8?
       if (input.length() == 2 && isDigit(input.charAt(1)) && input.charAt(1) != '0') {
          int sq = input.substring(1).toInt();
          if(sq >= 1 && sq <= 8) {
@@ -320,6 +285,7 @@ void loop() {
             moveToTarget(encX, calculateTargetX(sq), 0);
          }
       } 
+      // Or is it x5000?
       else if (input.length() > 1) {
          long target = input.substring(1).toInt();
          Serial.print(">>> X Raw Target: "); Serial.println(target);
@@ -329,6 +295,7 @@ void loop() {
 
     // --- Y COMMANDS ---
     else if (c == 'y') {
+      // Is it y1...y8?
       if (input.length() == 2 && isDigit(input.charAt(1)) && input.charAt(1) != '0') {
          int sq = input.substring(1).toInt();
          if(sq >= 1 && sq <= 8) {
@@ -336,6 +303,7 @@ void loop() {
             moveToTarget(encY, calculateTargetY(sq), 1);
          }
       } 
+      // Or is it y5000?
       else if (input.length() > 1) {
          long target = input.substring(1).toInt();
          Serial.print(">>> Y Raw Target: "); Serial.println(target);
@@ -343,7 +311,7 @@ void loop() {
       }
     }
 
-    // --- MANUAL JOGGING (No Live Print, just Move) ---
+    // --- MANUAL JOGGING ---
     else if (c == 'f') setX(MAX_SPEED_X, true);
     else if (c == 'b') setX(MAX_SPEED_X, false);
     else if (c == 'l') setY(MAX_SPEED_Y, true);
